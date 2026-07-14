@@ -11,9 +11,8 @@ Flow:
   6. Pick call-type and count with client-specific duration configs
   7. Choose sort order
   8. Run VAD (Silero) to get Talk Time / Silence / Dead Air / Longest Silence
-  9. Transcribe each call with Groq Whisper → RoBERTa sentiment analysis → add Sentiment column
- 10. Download final Excel report with two sheets: Call Report + Agent Analytics
- 11. Agent-wise analysis sheet included (updated categories: Short<2min, Medium 2-5min, Large>5min)
+  9. Download final Excel report with two sheets: Call Report + Agent Analytics
+ 10. Agent-wise analysis sheet included (updated categories: Short<2min, Medium 2-5min, Large>5min)
 """
 
 import os
@@ -34,13 +33,12 @@ import librosa
 from bs4 import BeautifulSoup
 import streamlit as st
 import torch
-import groq
 
 # ============================================================
 # PAGE CONFIG + SAAS-STYLE THEME
 # ============================================================
 st.set_page_config(
-    page_title="CallAI · Talk-Time + Sentiment",
+    page_title="CallAI · Talk-Time Analysis",
     page_icon="📞",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -214,8 +212,8 @@ st.markdown("""
 
 st.markdown("""
 <div class="callai-hero">
-    <h1>📞 CallAI · Talk-Time + Sentiment</h1>
-    <p>Pick a client, fetch calls, filter, get Talk-Time / Silence / Dead-Air, and now also analyse sentiment with Groq Whisper + RoBERTa.</p>
+    <h1>📞 CallAI · Talk-Time Analysis</h1>
+    <p>Pick a client, fetch calls, filter, and get Talk-Time / Silence / Dead-Air metrics for each call.</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -232,23 +230,6 @@ try:
 except:
     CRM_EMAIL = "ispark@dialdesk.in"
     CRM_PASSWORD = "1234"
-
-# ============================================================
-# GROQ API KEY - load from secrets
-# ============================================================
-try:
-    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
-except:
-    GROQ_API_KEY = ""
-
-# ============================================================
-# 🆕 HUGGING FACE TOKEN - load from secrets (optional but recommended)
-# ============================================================
-try:
-    HF_TOKEN = st.secrets["HF_TOKEN"]
-    os.environ["HF_TOKEN"] = HF_TOKEN
-except:
-    HF_TOKEN = None
 
 # ============================================================
 # ⚠️ CLIENTS - name -> company_id (edit this dict to add/remove clients)
@@ -436,7 +417,7 @@ def html_recording_to_direct_url(webform_url, retries=3):
             if meta_refresh and meta_refresh.get("content"):
                 m = re.search(r"url=([^;]+)", meta_refresh.get("content"), re.IGNORECASE)
                 if m:
-                    return html_recording_to_direct_url(urljoin(webform_url, m.group(1)), retries=retries - 1)
+                    return urljoin(webform_url, m.group(1))
             for link in soup.find_all("a", href=True):
                 href = link.get("href", "")
                 if any(ext in href.lower() for ext in audio_exts):
@@ -652,85 +633,6 @@ def generate_agent_analytics(df, duration_col='_duration_sec'):
     agent_stats['Rank'] = range(1, len(agent_stats) + 1)
     
     return agent_stats
-
-# ============================================================
-# 🆕 GROQ WHISPER + SENTIMENT FUNCTIONS - FIXED
-# ============================================================
-
-@st.cache_resource(show_spinner="🔄 Loading RoBERTa sentiment model (first run only)...")
-def load_sentiment_pipeline():
-    """
-    Load a RoBERTa-based sentiment analysis pipeline from Hugging Face.
-    Model: cardiffnlp/twitter-roberta-base-sentiment (supports negative/neutral/positive)
-    """
-    try:
-        # Lazy import - only loads transformers when this function is called
-        from transformers import pipeline
-        
-        # Check if token is available
-        if HF_TOKEN:
-            # Authenticated request with token
-            return pipeline(
-                "sentiment-analysis",
-                model="cardiffnlp/twitter-roberta-base-sentiment",
-                device=-1,  # CPU
-                top_k=None,
-                token=HF_TOKEN  # Add token for authentication
-            )
-        else:
-            # Fallback to unauthenticated (with warning)
-            return pipeline(
-                "sentiment-analysis",
-                model="cardiffnlp/twitter-roberta-base-sentiment",
-                device=-1,  # CPU
-                top_k=None
-            )
-    except Exception as e:
-        st.warning(f"⚠️ Sentiment model not available: {e}")
-        return None
-
-def groq_transcribe(audio_file_path, api_key):
-    """
-    Send audio file to Groq Whisper API and return the transcribed text.
-    """
-    if not api_key:
-        return ""
-    try:
-        client = groq.Groq(api_key=api_key)
-        with open(audio_file_path, "rb") as f:
-            transcription = client.audio.transcriptions.create(
-                file=(os.path.basename(audio_file_path), f.read()),
-                model="whisper-large-v3-turbo",
-                response_format="text",
-                language="en"
-            )
-        return transcription
-    except Exception as e:
-        return ""
-
-def analyze_sentiment(text, pipeline):
-    """
-    Use the loaded RoBERTa pipeline to get sentiment label.
-    Returns one of: 'Positive', 'Negative', 'Neutral'.
-    """
-    if not text or not text.strip():
-        return "Neutral"
-    if pipeline is None:
-        return "Neutral"
-    try:
-        results = pipeline(text)
-        if results and isinstance(results, list) and len(results) > 0:
-            best = max(results[0], key=lambda x: x['score'])
-            label = best['label']
-            if label == 'LABEL_2':
-                return "Positive"
-            elif label == 'LABEL_0':
-                return "Negative"
-            else:
-                return "Neutral"
-    except Exception as e:
-        return "Neutral"
-    return "Neutral"
 
 # ============================================================
 # 🆕 CUSTOM FILTER FUNCTION - Parse user filter expression
@@ -1068,11 +970,11 @@ if have_data:
     st.markdown('</div>', unsafe_allow_html=True)  # end step-card
 
     # ============================================================
-    # STEP 3 — RUN VAD + SENTIMENT ANALYSIS
+    # STEP 3 — RUN VAD ANALYSIS (NO SENTIMENT)
     # ============================================================
     st.markdown('<div class="step-card">', unsafe_allow_html=True)
-    st.markdown('<div class="step-title"><span class="step-badge">3</span>Run Talk-Time & Sentiment Analysis</div>', unsafe_allow_html=True)
-    st.markdown('<p class="step-subtitle">Downloads recordings, measures speech/silence, transcribes with Groq Whisper, and performs RoBERTa sentiment analysis.</p>', unsafe_allow_html=True)
+    st.markdown('<div class="step-title"><span class="step-badge">3</span>Run Talk-Time Analysis</div>', unsafe_allow_html=True)
+    st.markdown('<p class="step-subtitle">Downloads recordings and measures speech/silence using Silero VAD.</p>', unsafe_allow_html=True)
 
     with st.expander("⚙️ Fine-tune detection accuracy (optional)"):
         st.caption(
@@ -1090,7 +992,7 @@ if have_data:
             min_value=1, value=5, step=1,
         )
 
-    run_vad_clicked = st.button("▶️  Run Analysis & Build Report", type="primary")
+    run_vad_clicked = st.button("▶️  Run VAD Analysis & Build Report", type="primary")
 
     if run_vad_clicked:
         if not col_recording:
@@ -1098,9 +1000,6 @@ if have_data:
         elif len(selected_df) == 0:
             st.warning("No calls selected — nothing to process.")
         else:
-            # ---------- Load sentiment pipeline ----------
-            sentiment_pipeline = load_sentiment_pipeline()
-
             @st.cache_resource(show_spinner="🔄 Loading voice-detection model (first run only)...")
             def load_vad_model():
                 progress_bar = st.progress(0)
@@ -1234,8 +1133,6 @@ if have_data:
                         "talk_time": None, "silence_time": None,
                         "dead_air": None, "longest_silence": None, "duration": None,
                     }
-                    sentiment = "N/A"
-                    transcript = None
                     debug_status = "OK"
                     actual_mp3 = None
                     mp3_path = os.path.join(tmpdir, f"{i}.mp3")
@@ -1287,22 +1184,7 @@ if have_data:
                                                 merged = merge_intervals([(s["start"] / 16000, s["end"] / 16000) for s in ts])
                                             metrics = compute_metrics(merged, total_duration)
                                             metrics["duration"] = round(total_duration, 2)
-                                            
-                                            # ---- NEW: Groq Whisper transcription ----
-                                            if GROQ_API_KEY:
-                                                try:
-                                                    transcript = groq_transcribe(mp3_path, GROQ_API_KEY)
-                                                    # Sentiment analysis on transcript
-                                                    sentiment = analyze_sentiment(transcript, sentiment_pipeline)
-                                                except Exception as e:
-                                                    debug_status = f"Groq/Sentiment error: {str(e)[:100]}"
-                                                    transcript = None
-                                                    sentiment = "Error"
-                                                else:
-                                                    debug_status = "OK"
-                                            else:
-                                                sentiment = "No API Key"
-                                                debug_status = "No API Key"
+                                            debug_status = "OK"
                     except requests.exceptions.RequestException as e:
                         debug_status = f"Network/download error: {str(e)[:100]}"
                     except Exception as e:
@@ -1315,7 +1197,7 @@ if have_data:
                             try: os.remove(wav_path)
                             except Exception: pass
 
-                    if debug_status != "OK" and debug_status != "No API Key" and "Groq" not in debug_status:
+                    if debug_status != "OK":
                         st.warning(f"Row {i+1} ({row.get(col_agent) if col_agent else ''}): {debug_status}")
 
                     crm_duration = row.get("_duration_sec")
@@ -1332,7 +1214,6 @@ if have_data:
                         "Silence Time": metrics.get("silence_time"),
                         "Dead Air(included in Silence time)": metrics.get("dead_air"),
                         "Longest Silence": metrics.get("longest_silence"),
-                        "Sentiment": sentiment,
                         "_debug_status": debug_status,
                     })
                     progress.progress((i + 1) / total_rows)
@@ -1360,7 +1241,6 @@ if have_data:
                 "Silence Time",
                 "Dead Air(included in Silence time)",
                 "Longest Silence",
-                "Sentiment",
                 "Audio Duration(sec)",
                 "Actual MP3",
             ]
@@ -1454,13 +1334,12 @@ if have_data:
             "Silence Time",
             "Dead Air(included in Silence time)",
             "Longest Silence",
-            "Sentiment",
             "Audio Duration(sec)",
             "Actual MP3",
         ]
         st.markdown('<div class="step-card">', unsafe_allow_html=True)
         st.markdown('<div class="step-title"><span class="step-badge">4</span>Download Report</div>', unsafe_allow_html=True)
-        st.markdown('<p class="step-subtitle">Excel file with two sheets: Detailed Call Report (now with Sentiment) and Agent-Wise Analytics (Short<2min, Medium 2-5min, Large>5min).</p>', unsafe_allow_html=True)
+        st.markdown('<p class="step-subtitle">Excel file with two sheets: Detailed Call Report and Agent-Wise Analytics (Short<2min, Medium 2-5min, Large>5min).</p>', unsafe_allow_html=True)
 
         export_df = st.session_state["final_df"][EXPORT_COLUMNS]
         agent_export_df = st.session_state.get("agent_analytics_df")
