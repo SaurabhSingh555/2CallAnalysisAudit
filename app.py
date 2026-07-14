@@ -613,11 +613,20 @@ def load_sentiment_pipeline():
     try:
         # Lazy import - only loads transformers when this function is called
         from transformers import pipeline
+        
+        # Try to get HF token from secrets for better rate limits
+        try:
+            hf_token = st.secrets.get("HF_TOKEN", None)
+        except:
+            hf_token = None
+        
         return pipeline(
             "sentiment-analysis",
             model="cardiffnlp/twitter-roberta-base-sentiment",
             device=-1,  # CPU
-            top_k=None
+            top_k=None,
+            use_auth_token=hf_token,
+            model_kwargs={"cache_dir": "./cache"}  # Cache locally
         )
     except Exception as e:
         st.warning(f"⚠️ Sentiment model not available: {e}")
@@ -932,7 +941,7 @@ if have_data:
     table_df = table_df[final_display_cols]
 
     st.markdown(f"### Filtered Data – Sorted by Duration ({'ascending' if ascending_sort else 'descending'})")
-    st.dataframe(table_df, use_container_width=True, height=350)
+    st.dataframe(table_df, width='stretch', height=350)
 
     st.markdown('</div>', unsafe_allow_html=True)  # end step-card
 
@@ -1228,7 +1237,7 @@ if have_data:
             else:
                 st.success("✅ All calls processed successfully.")
 
-            st.dataframe(final_df.drop(columns=["_debug_status"]), use_container_width=True, height=380)
+            st.dataframe(final_df.drop(columns=["_debug_status"]), width='stretch', height=380)
             
             # Display Agent Analytics if available
             if agent_analytics_df is not None and len(agent_analytics_df) > 0:
@@ -1284,7 +1293,7 @@ if have_data:
                         'Medium_Calls', 'Medium_%', 'Large_Calls', 'Large_%',
                         'Avg_Duration_Formatted', 'Total_Duration_Formatted'
                     ]],
-                    use_container_width=True,
+                    width='stretch',
                     height=300
                 )
 
