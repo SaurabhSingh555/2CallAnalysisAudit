@@ -11,14 +11,11 @@ Flow:
   6. Pick call-type and count
   7. Choose sort order
   8. Run VAD (Silero) to get Talk Time / Silence / Dead Air / Longest Silence
-  9. Transcribe each call with Groq Whisper → Groq LLM sentiment analysis → add Sentiment column
+  9. Transcribe each call with Groq Whisper → RoBERTa sentiment analysis → add Sentiment column
  10. Download final Excel report with two sheets: Call Report + Agent Analytics
  11. Agent-wise analysis sheet included (updated categories: Short<2min, Medium 2-5min, Large>5min)
-
-NOTE: Hugging Face / transformers / RoBERTa has been fully removed. Sentiment is now
-computed via a Groq chat-completion call (same API you already use for transcription),
-so there is no local model download and no risk of the app hanging on a HF Hub fetch.
 """
+
 import os
 import re
 import io
@@ -28,6 +25,7 @@ import subprocess
 import tempfile
 from datetime import date, timedelta
 from urllib.parse import urljoin
+
 import numpy as np
 import pandas as pd
 import requests
@@ -37,6 +35,7 @@ from bs4 import BeautifulSoup
 import streamlit as st
 import torch
 import groq
+
 # ============================================================
 # PAGE CONFIG + SAAS-STYLE THEME
 # ============================================================
@@ -46,20 +45,24 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
 st.markdown("""
 <style>
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
     [data-testid="stSidebar"] {display: none;}
+
     html, body, [class*="css"] {
         font-family: -apple-system, "Segoe UI", Inter, Roboto, Arial, sans-serif;
     }
+
     .block-container {
         padding-top: 1.5rem;
         padding-bottom: 3rem;
         max-width: 1100px;
     }
+
     .callai-hero {
         background: linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%);
         padding: 28px 32px;
@@ -79,6 +82,7 @@ st.markdown("""
         margin: 0;
         opacity: 0.9;
     }
+
     .step-card {
         background: #FFFFFF;
         border: 1px solid #ECECF4;
@@ -113,6 +117,7 @@ st.markdown("""
         font-size: 13.5px;
         margin: 0 0 16px 40px;
     }
+
     .metric-pill {
         background: #F5F4FF;
         border: 1px solid #E4E1FF;
@@ -130,6 +135,7 @@ st.markdown("""
         color: #6E7191;
         margin-top: 2px;
     }
+
     div.stButton > button {
         border-radius: 10px;
         font-weight: 600;
@@ -147,12 +153,14 @@ st.markdown("""
         border: none;
         padding: 0.7rem 1.4rem;
     }
+
     div[role="radiogroup"] label {
         border: 1px solid #E4E1FF;
         padding: 6px 14px;
         border-radius: 20px;
         margin-right: 6px;
     }
+
     .status-banner-ok {
         background: #ECFDF5;
         border: 1px solid #6EE7B7;
@@ -171,7 +179,7 @@ st.markdown("""
         font-weight: 600;
         font-size: 13.5px;
     }
-
+    
     .agent-card {
         background: #F8F7FF;
         border-left: 4px solid #4F46E5;
@@ -195,31 +203,36 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
 st.markdown("""
 <div class="callai-hero">
     <h1>📞 CallAI · Talk-Time + Sentiment</h1>
-    <p>Pick a client, fetch calls, filter, get Talk-Time / Silence / Dead-Air, and now also analyse sentiment with Groq Whisper + Groq LLM.</p>
+    <p>Pick a client, fetch calls, filter, get Talk-Time / Silence / Dead-Air, and now also analyse sentiment with Groq Whisper + RoBERTa.</p>
 </div>
 """, unsafe_allow_html=True)
+
 CRM_BASE = "https://crmapi.dialdesk.in"
 LOGIN_URL = f"{CRM_BASE}/auth/login"
 CDR_URL = f"{CRM_BASE}/report/cdr_report"
+
 # ============================================================
 # ⚠️ FIXED CRM CREDENTIALS - Loaded from Streamlit Secrets (with fallback)
 # ============================================================
 try:
     CRM_EMAIL = st.secrets["CRM_EMAIL"]
     CRM_PASSWORD = st.secrets["CRM_PASSWORD"]
-except Exception:
+except:
     CRM_EMAIL = "ispark@dialdesk.in"
     CRM_PASSWORD = "1234"
+
 # ============================================================
 # GROQ API KEY - load from secrets
 # ============================================================
 try:
     GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
-except Exception:
+except:
     GROQ_API_KEY = ""
+
 # ============================================================
 # ⚠️ CLIENTS - name -> company_id (edit this dict to add/remove clients)
 # ============================================================
@@ -231,6 +244,7 @@ CLIENTS = {
     "Fortum Charge": "395",
     "Alphanso": "629",
 }
+
 # ============================================================
 # SESSION STATE DEFAULTS
 # ============================================================
@@ -245,6 +259,7 @@ defaults = {
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
 # ============================================================
 # CRM FUNCTIONS
 # ============================================================
@@ -267,11 +282,13 @@ def do_login():
         raise RuntimeError(f"Login response had no token field: {data}")
     st.session_state["token"] = token
     return token
+
 def get_valid_token():
     if not st.session_state.get("token"):
         with st.spinner("Signing in..."):
             do_login()
     return st.session_state["token"]
+
 def fetch_cdr(payload, retry_on_401=True):
     token = get_valid_token()
     headers = {
@@ -284,8 +301,9 @@ def fetch_cdr(payload, retry_on_401=True):
         do_login()
         return fetch_cdr(payload, retry_on_401=False)
     return resp
+
 # ============================================================
-# RECORDING DOWNLOAD FUNCTIONS
+# RECORDING DOWNLOAD FUNCTIONS (UPDATED)
 # ============================================================
 def html_recording_to_direct_url(webform_url, retries=3):
     """
@@ -304,21 +322,22 @@ def html_recording_to_direct_url(webform_url, retries=3):
             # Use stream=True so we can check headers without downloading full body
             resp = session.get(webform_url, headers=headers, timeout=30, stream=True)
             resp.raise_for_status()
-
+            
             # 1. If Content-Type indicates audio/video, return the final URL
             content_type = resp.headers.get('content-type', '').lower()
             if 'audio' in content_type or 'video' in content_type:
                 return resp.url
-
+            
             # 2. If final URL ends with an audio extension, accept it
             if resp.url.lower().endswith(audio_exts):
                 return resp.url
-
+            
             # 3. Otherwise, assume it's HTML – we need to read the body
+            # Because we used stream=True, we can still access resp.text
             html = resp.text
             soup = BeautifulSoup(html, "html.parser")
-
-            # ----- HTML parsing -----
+            
+            # ----- HTML parsing (same as before) -----
             for tag in soup.find_all(["audio", "video"]):
                 src = tag.get("src")
                 if src and any(ext in src.lower() for ext in audio_exts):
@@ -376,6 +395,7 @@ def html_recording_to_direct_url(webform_url, retries=3):
                 return None
             time.sleep(1)
     return None
+
 def resolve_audio_url(recording_url):
     if not isinstance(recording_url, str) or not recording_url.strip():
         return None
@@ -383,6 +403,7 @@ def resolve_audio_url(recording_url):
     if recording_url.lower().endswith((".mp3", ".wav", ".m4a", ".mp4")):
         return recording_url
     return html_recording_to_direct_url(recording_url)
+
 # ============================================================
 # FLEXIBLE COLUMN MAPPING
 # ============================================================
@@ -393,12 +414,14 @@ COLUMN_CANDIDATES = {
     "call_from": ["phone_number", "PhoneNumber", "Call From"],
     "recording": ["Recording", "RecordingUrl", "RecordingURL", "recording_url"],
 }
+
 def find_column(df, keys):
     lower_map = {c.lower(): c for c in df.columns}
     for key in keys:
         if key.lower() in lower_map:
             return lower_map[key.lower()]
     return None
+
 def parse_duration_series_to_seconds(series):
     s = series.astype(str).str.strip()
     numeric = pd.to_numeric(s, errors="coerce")
@@ -419,6 +442,7 @@ def parse_duration_series_to_seconds(series):
             return np.nan
         numeric.loc[needs_time_parse] = s.loc[needs_time_parse].apply(to_seconds)
     return numeric
+
 def resolve_duration_column(df):
     candidates_in_order = [
         ("call_duration", "sec"),
@@ -441,6 +465,7 @@ def resolve_duration_column(df):
         if non_null > 0 and score > best_score:
             best_col, best_seconds, best_score = col, seconds.fillna(0), score
     return best_col, best_seconds
+
 def fmt_hms(total_seconds):
     if total_seconds is None or (isinstance(total_seconds, float) and np.isnan(total_seconds)):
         return "-"
@@ -450,10 +475,11 @@ def fmt_hms(total_seconds):
     if h:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
+
 def filter_out_vdcl_calls(df):
     if df is None or len(df) == 0:
         return df, 0
-
+    
     agent_col = None
     if 'Agent Name' in df.columns:
         agent_col = 'Agent Name'
@@ -471,14 +497,14 @@ def filter_out_vdcl_calls(df):
             if 'agent name' in col_lower or 'agentname' in col_lower or 'full_name' in col_lower:
                 agent_col = col
                 break
-
+    
     if agent_col is None:
         return df, 0
-
+    
     agent_values = df[agent_col].fillna('').astype(str)
     mask = agent_values.str.contains('VDCL', case=False, na=False, regex=False)
     removed_count = mask.sum()
-
+    
     if removed_count > 0:
         removed_samples = df[mask][agent_col].head(5).tolist()
         st.session_state['vdcl_removed'] = removed_count
@@ -488,9 +514,10 @@ def filter_out_vdcl_calls(df):
             f'Samples: {sample_str}</div>',
             unsafe_allow_html=True
         )
-
+    
     filtered_df = df[~mask].copy()
     return filtered_df, removed_count
+
 # ============================================================
 # AGENT ANALYTICS FUNCTION (UPDATED CATEGORIES)
 # ============================================================
@@ -503,22 +530,22 @@ def generate_agent_analytics(df, duration_col='_duration_sec'):
     """
     if df is None or len(df) == 0:
         return None
-
+    
     # Find agent column
     agent_col = None
     for col in ['full_name', 'agent', 'Agent Name', 'AgentName', 'agent_name']:
         if col in df.columns:
             agent_col = col
             break
-
+    
     if agent_col is None:
         return None
-
+    
     # Create a copy with the duration column
     df_copy = df.copy()
     if duration_col not in df_copy.columns:
         return None
-
+    
     # Categorize calls (updated)
     def categorize_call(duration):
         if duration < 120:          # < 2 min
@@ -527,22 +554,22 @@ def generate_agent_analytics(df, duration_col='_duration_sec'):
             return 'Medium'
         else:                       # > 5 min
             return 'Large'
-
+    
     df_copy['Call_Category'] = df_copy[duration_col].apply(categorize_call)
-
+    
     # Group by agent
     agent_stats = df_copy.groupby(agent_col).agg({
         duration_col: ['count', 'mean', 'sum'],
         'Call_Category': lambda x: x.value_counts().to_dict()
     }).reset_index()
-
+    
     # Flatten column names
     agent_stats.columns = ['Agent', 'Total_Calls', 'Avg_Duration', 'Total_Duration', 'Category_Counts']
-
+    
     # Extract category counts
     def extract_category_counts(category_dict, category):
         return category_dict.get(category, 0)
-
+    
     agent_stats['Short_Calls'] = agent_stats['Category_Counts'].apply(
         lambda x: extract_category_counts(x, 'Short')
     )
@@ -552,30 +579,50 @@ def generate_agent_analytics(df, duration_col='_duration_sec'):
     agent_stats['Large_Calls'] = agent_stats['Category_Counts'].apply(
         lambda x: extract_category_counts(x, 'Large')
     )
-
+    
     # Calculate percentages
     agent_stats['Short_%'] = (agent_stats['Short_Calls'] / agent_stats['Total_Calls'] * 100).round(2)
     agent_stats['Medium_%'] = (agent_stats['Medium_Calls'] / agent_stats['Total_Calls'] * 100).round(2)
     agent_stats['Large_%'] = (agent_stats['Large_Calls'] / agent_stats['Total_Calls'] * 100).round(2)
-
+    
     # Format duration columns
     agent_stats['Avg_Duration_Formatted'] = agent_stats['Avg_Duration'].apply(fmt_hms)
     agent_stats['Total_Duration_Formatted'] = agent_stats['Total_Duration'].apply(fmt_hms)
-
+    
     # Drop the Category_Counts column
     agent_stats = agent_stats.drop('Category_Counts', axis=1)
-
+    
     # Sort by total calls (descending)
     agent_stats = agent_stats.sort_values('Total_Calls', ascending=False)
-
+    
     # Add ranking
     agent_stats['Rank'] = range(1, len(agent_stats) + 1)
-
+    
     return agent_stats
+
 # ============================================================
-# GROQ WHISPER (TRANSCRIPTION) + GROQ LLM (SENTIMENT)
-# Hugging Face / transformers / RoBERTa has been removed entirely.
+# 🆕 GROQ WHISPER + SENTIMENT FUNCTIONS - FIXED (Lazy Loading)
 # ============================================================
+
+@st.cache_resource(show_spinner="Loading RoBERTa sentiment model (first run only)...")
+def load_sentiment_pipeline():
+    """
+    Load a RoBERTa-based sentiment analysis pipeline from Hugging Face.
+    Model: cardiffnlp/twitter-roberta-base-sentiment (supports negative/neutral/positive)
+    """
+    try:
+        # Lazy import - only loads transformers when this function is called
+        from transformers import pipeline
+        return pipeline(
+            "sentiment-analysis",
+            model="cardiffnlp/twitter-roberta-base-sentiment",
+            device=-1,  # CPU
+            top_k=None
+        )
+    except Exception as e:
+        st.warning(f"⚠️ Sentiment model not available: {e}")
+        return None
+
 def groq_transcribe(audio_file_path, api_key):
     """
     Send audio file to Groq Whisper API and return the transcribed text.
@@ -592,44 +639,35 @@ def groq_transcribe(audio_file_path, api_key):
                 language="en"
             )
         return transcription
-    except Exception:
+    except Exception as e:
         return ""
-def analyze_sentiment(text, api_key):
+
+def analyze_sentiment(text, pipeline):
     """
-    Use a Groq chat-completion call to classify sentiment.
+    Use the loaded RoBERTa pipeline to get sentiment label.
     Returns one of: 'Positive', 'Negative', 'Neutral'.
-    No local model download required.
     """
     if not text or not text.strip():
         return "Neutral"
-    if not api_key:
-        return "N/A"
-    try:
-        client = groq.Groq(api_key=api_key)
-        resp = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Classify the sentiment of the call transcript as exactly one word: "
-                        "Positive, Negative, or Neutral. Reply with only that single word, "
-                        "nothing else."
-                    ),
-                },
-                {"role": "user", "content": text[:4000]},
-            ],
-            temperature=0,
-            max_tokens=5,
-        )
-        label = resp.choices[0].message.content.strip().capitalize()
-        if label not in ("Positive", "Negative", "Neutral"):
-            return "Neutral"
-        return label
-    except Exception:
+    if pipeline is None:
         return "Neutral"
+    try:
+        results = pipeline(text)
+        if results and isinstance(results, list) and len(results) > 0:
+            best = max(results[0], key=lambda x: x['score'])
+            label = best['label']
+            if label == 'LABEL_2':
+                return "Positive"
+            elif label == 'LABEL_0':
+                return "Negative"
+            else:
+                return "Neutral"
+    except Exception as e:
+        return "Neutral"
+    return "Neutral"
+
 # ============================================================
-# CUSTOM FILTER FUNCTION - Parse user filter expression
+# 🆕 CUSTOM FILTER FUNCTION - Parse user filter expression
 # ============================================================
 def apply_custom_filter(df, filter_expr):
     """
@@ -641,22 +679,22 @@ def apply_custom_filter(df, filter_expr):
     """
     if df is None or len(df) == 0:
         return df
-
+    
     if not filter_expr or not filter_expr.strip():
         return df
-
+    
     # Clean the expression
     expr = filter_expr.strip()
-
+    
     # Replace 'duration' with actual column name
     expr = expr.replace('duration', 'df["_duration_sec"]')
-
+    
     # Safety: only allow safe operations
     safe_chars = set('0123456789.() +-*/<>=andornotdf["_duration_sec"]')
     if not all(c in safe_chars or c.isspace() for c in expr):
         st.error("⚠️ Invalid characters in filter expression. Use only numbers, operators, and 'duration'.")
         return df
-
+    
     try:
         # Evaluate the expression
         filtered_df = df[eval(expr)]
@@ -664,12 +702,14 @@ def apply_custom_filter(df, filter_expr):
     except Exception as e:
         st.error(f"⚠️ Error in filter expression: {e}")
         return df
+
 # ============================================================
 # STEP 1 — CLIENT + DATE RANGE + FETCH
 # ============================================================
 st.markdown('<div class="step-card">', unsafe_allow_html=True)
 st.markdown('<div class="step-title"><span class="step-badge">1</span>Choose Client & Date Range</div>', unsafe_allow_html=True)
 st.markdown('<p class="step-subtitle">Only calls belonging to the selected client will be fetched.</p>', unsafe_allow_html=True)
+
 c1, c2 = st.columns([1.2, 1.8])
 with c1:
     client_name = st.selectbox("Client", options=list(CLIENTS.keys()))
@@ -682,14 +722,17 @@ with c2:
         to_date = st.date_input("End Date", value=date.today(), max_value=date.today())
     if from_date > to_date:
         st.error("End Date must be on or after Start Date.")
+
 # ---- Clear old data if client changed ----
 if st.session_state.get("cdr_client") is not None and st.session_state["cdr_client"] != client_name:
     st.session_state["cdr_df"] = None
     st.session_state["cdr_client"] = None
     st.session_state["final_df"] = None
     st.session_state["agent_analytics_df"] = None
+
 fetch_clicked = st.button("📥  Fetch Calls", type="primary")
 st.markdown('</div>', unsafe_allow_html=True)
+
 # ============================================================
 # FETCH CDR REPORT
 # ============================================================
@@ -714,18 +757,19 @@ if fetch_clicked:
                             records = v
                             break
                 cdr_df = pd.DataFrame(records)
-
+                
                 # Auto-filter VDCL (abandoned) calls
                 cdr_df, removed_count = filter_out_vdcl_calls(cdr_df)
-
+                
                 # Add _duration_sec for internal use
                 dur_source_col, duration_seconds = resolve_duration_column(cdr_df)
                 cdr_df["_duration_sec"] = duration_seconds
+
                 st.session_state["cdr_df"] = cdr_df
                 st.session_state["cdr_client"] = client_name
                 st.session_state["final_df"] = None
                 st.session_state["agent_analytics_df"] = None
-
+                
                 if len(cdr_df) == 0:
                     st.warning(f"No valid calls found for **{client_name}** in this date range (VDCL calls auto-removed).")
                 else:
@@ -738,6 +782,7 @@ if fetch_clicked:
                 st.error(f"Fetch failed: HTTP {resp.status_code} — {resp.text[:300]}")
         except Exception as e:
             st.error(f"Fetch error: {e}")
+
 # ============================================================
 # STEP 2 — FILTER & DISPLAY (single table)
 # ============================================================
@@ -746,6 +791,7 @@ have_data = (
     and len(st.session_state["cdr_df"]) > 0
     and st.session_state.get("cdr_client") == client_name
 )
+
 if have_data:
     cdr_df = st.session_state["cdr_df"].copy()
     col_date = find_column(cdr_df, COLUMN_CANDIDATES["date"])
@@ -754,16 +800,21 @@ if have_data:
     col_phone = find_column(cdr_df, COLUMN_CANDIDATES["call_from"])
     col_recording = find_column(cdr_df, COLUMN_CANDIDATES["recording"])
     dur_source_col, duration_seconds = resolve_duration_column(cdr_df)
+
     # Double-check VDCL
     cdr_df, _ = filter_out_vdcl_calls(cdr_df)
+
     if dur_source_col is None:
         st.error("Could not find a usable call-duration column.")
         st.stop()
+
     cdr_df["_duration_sec"] = duration_seconds
+
     # ---- Step 2 card ----
     st.markdown('<div class="step-card">', unsafe_allow_html=True)
     st.markdown('<div class="step-title"><span class="step-badge">2</span>Pick Call Type & Count</div>', unsafe_allow_html=True)
     st.markdown('<p class="step-subtitle">Choose which calls you want in the report.</p>', unsafe_allow_html=True)
+
     # Summary pills
     p1, p2, p3 = st.columns(3)
     with p1:
@@ -773,7 +824,8 @@ if have_data:
         st.markdown(f'<div class="metric-pill"><div class="value">{fmt_hms(avg_dur)}</div><div class="label">Average call duration</div></div>', unsafe_allow_html=True)
     with p3:
         st.markdown(f'<div class="metric-pill"><div class="value">{client_name}</div><div class="label">Client</div></div>', unsafe_allow_html=True)
-    # Filter controls
+
+    # Filter controls - UPDATED with Custom Filter option
     bcol, ccol = st.columns([2, 1.2])
     with bcol:
         bucket = st.radio(
@@ -783,11 +835,11 @@ if have_data:
                 "Short (< 2 min)",
                 "Medium (2 – 5 min)",
                 "Large (> 5 min)",
-                "Custom Filter",
+                "Custom Filter",  # NEW option
             ],
             horizontal=True,
         )
-
+        
         # Custom filter input - shown only when Custom Filter is selected
         custom_filter_expr = ""
         if bucket == "Custom Filter":
@@ -824,9 +876,10 @@ if have_data:
                 if st.button("📊 5-10 min", use_container_width=True):
                     st.session_state.custom_filter_input = "duration >= 300 and duration <= 600"
                     st.rerun()
-
+    
     with ccol:
         count_mode = st.radio("How many calls?", ["All matching", "Manual number"], horizontal=True)
+
     # Sort order
     sort_order = st.radio(
         "Sort by Duration",
@@ -836,6 +889,7 @@ if have_data:
         help="Choose how the table is sorted."
     )
     ascending_sort = sort_order.startswith("Ascending")
+
     # --- Determine selected data based on filters ---
     if bucket == "Short (< 2 min)":
         matched = cdr_df[cdr_df["_duration_sec"] < 120]
@@ -849,6 +903,7 @@ if have_data:
             st.warning("No calls match your filter expression. Please check the syntax.")
     else:  # All calls
         matched = cdr_df
+
     available = len(matched)
     if count_mode == "Manual number":
         manual_n = st.number_input("Number of calls", min_value=1, value=min(50, available) if available else 1, step=1)
@@ -863,6 +918,7 @@ if have_data:
             st.info(f"Showing all {available} matching calls for custom filter: `{custom_filter_expr}`")
         else:
             st.info(f"Showing all {available} matching calls for **{bucket}**.")
+
     # --- Build the SINGLE filtered table (duration first, S.No, sorted) ---
     display_cols = [
         "campaign_id", "agent", "full_name", "leadid", "phone_number",
@@ -874,15 +930,19 @@ if have_data:
     table_df.insert(1, "S.No", range(1, len(table_df) + 1))
     final_display_cols = ["_duration_sec", "S.No"] + [c for c in available_display_cols if c != "_duration_sec"]
     table_df = table_df[final_display_cols]
+
     st.markdown(f"### Filtered Data – Sorted by Duration ({'ascending' if ascending_sort else 'descending'})")
-    st.dataframe(table_df, width='stretch', height=350)
+    st.dataframe(table_df, use_container_width=True, height=350)
+
     st.markdown('</div>', unsafe_allow_html=True)  # end step-card
+
     # ============================================================
     # STEP 3 — RUN VAD + SENTIMENT ANALYSIS
     # ============================================================
     st.markdown('<div class="step-card">', unsafe_allow_html=True)
     st.markdown('<div class="step-title"><span class="step-badge">3</span>Run Talk-Time & Sentiment Analysis</div>', unsafe_allow_html=True)
-    st.markdown('<p class="step-subtitle">Downloads recordings, measures speech/silence, transcribes with Groq Whisper, and performs sentiment analysis via Groq LLM.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="step-subtitle">Downloads recordings, measures speech/silence, transcribes with Groq Whisper, and performs RoBERTa sentiment analysis.</p>', unsafe_allow_html=True)
+
     with st.expander("⚙️ Fine-tune detection accuracy (optional)"):
         st.caption(
             "If Talk Time is coming out too low / Silence too high, move the slider "
@@ -898,13 +958,18 @@ if have_data:
             "Count a pause as 'Dead Air' only if longer than (sec)",
             min_value=1, value=5, step=1,
         )
+
     run_vad_clicked = st.button("▶️  Run Analysis & Build Report", type="primary")
+
     if run_vad_clicked:
         if not col_recording:
             st.error("No recording-URL column found in CDR data — cannot fetch recordings.")
         elif len(selected_df) == 0:
             st.warning("No calls selected — nothing to process.")
         else:
+            # ---------- Load sentiment pipeline ----------
+            sentiment_pipeline = load_sentiment_pipeline()
+
             @st.cache_resource(show_spinner="Loading voice-detection model (first run only)...")
             def load_vad_model():
                 hub_dir = os.path.expanduser("~/.cache/torch/hub")
@@ -913,7 +978,7 @@ if have_data:
                 except Exception:
                     hub_dir = os.path.join(tempfile.gettempdir(), "torch_hub")
                     os.makedirs(hub_dir, exist_ok=True)
-
+                
                 torch.hub.set_dir(hub_dir)
                 try:
                     model, utils = torch.hub.load(
@@ -924,8 +989,10 @@ if have_data:
                         "snakers4/silero-vad", "silero_vad", force_reload=False
                     )
                 return model, utils
+
             model, utils = load_vad_model()
             get_speech_timestamps = utils[0]
+
             VAD_CFG = {
                 "threshold": vad_threshold,
                 "min_speech_duration_ms": 100,
@@ -934,6 +1001,7 @@ if have_data:
                 "window_size_samples": 512,
                 "dead_air_threshold_sec": dead_air_secs,
             }
+
             def robust_normalize(audio):
                 rms = np.sqrt(np.mean(np.square(audio)))
                 if rms > 1e-4:
@@ -942,6 +1010,7 @@ if have_data:
                     gain = min(gain, 20.0)
                     audio = audio * gain
                 return np.clip(audio, -1.0, 1.0)
+
             def load_channel_16k(data, sr, channel_idx=None):
                 if data.ndim > 1:
                     chan = data[:, channel_idx] if channel_idx is not None else np.mean(data, axis=1)
@@ -951,6 +1020,7 @@ if have_data:
                 if sr != 16000:
                     chan = librosa.resample(chan, orig_sr=sr, target_sr=16000)
                 return torch.from_numpy(chan).float()
+
             def run_vad(audio_tensor):
                 return get_speech_timestamps(
                     audio_tensor, model, sampling_rate=16000,
@@ -960,6 +1030,7 @@ if have_data:
                     speech_pad_ms=VAD_CFG["speech_pad_ms"],
                     window_size_samples=VAD_CFG["window_size_samples"],
                 )
+
             def merge_intervals(intervals):
                 if not intervals:
                     return []
@@ -971,6 +1042,7 @@ if have_data:
                     else:
                         merged.append([s, e])
                 return merged
+
             def compute_metrics(intervals, total_duration):
                 if not intervals:
                     return {
@@ -998,10 +1070,12 @@ if have_data:
                     "dead_air": round(dead_air, 2),
                     "longest_silence": round(longest_silence, 2),
                 }
+
             results = []
             progress = st.progress(0)
             status = st.empty()
             total_rows = len(selected_df)
+
             with tempfile.TemporaryDirectory() as tmpdir:
                 for i, (_, row) in enumerate(selected_df.iterrows()):
                     status.text(f"Processing call {i+1}/{total_rows}...")
@@ -1016,6 +1090,7 @@ if have_data:
                     actual_mp3 = None
                     mp3_path = os.path.join(tmpdir, f"{i}.mp3")
                     wav_path = os.path.join(tmpdir, f"{i}.wav")
+
                     try:
                         if not rec_url:
                             debug_status = "No recording URL in this row"
@@ -1062,14 +1137,15 @@ if have_data:
                                                 merged = merge_intervals([(s["start"] / 16000, s["end"] / 16000) for s in ts])
                                             metrics = compute_metrics(merged, total_duration)
                                             metrics["duration"] = round(total_duration, 2)
-
-                                            # ---- Groq Whisper transcription + Groq sentiment ----
+                                            
+                                            # ---- NEW: Groq Whisper transcription ----
                                             if GROQ_API_KEY:
                                                 try:
                                                     transcript = groq_transcribe(mp3_path, GROQ_API_KEY)
-                                                    sentiment = analyze_sentiment(transcript, GROQ_API_KEY)
+                                                    # Sentiment analysis on transcript
+                                                    sentiment = analyze_sentiment(transcript, sentiment_pipeline)
                                                 except Exception as e:
-                                                    debug_status = f"Groq error: {str(e)[:100]}"
+                                                    debug_status = f"Groq/Sentiment error: {str(e)[:100]}"
                                                     transcript = None
                                                     sentiment = "Error"
                                                 else:
@@ -1088,9 +1164,12 @@ if have_data:
                         if os.path.exists(wav_path):
                             try: os.remove(wav_path)
                             except Exception: pass
+
                     if debug_status != "OK" and debug_status != "No API Key" and "Groq" not in debug_status:
                         st.warning(f"Row {i+1} ({row.get(col_agent) if col_agent else ''}): {debug_status}")
+
                     crm_duration = row.get("_duration_sec")
+
                     results.append({
                         "Date": row.get(col_date) if col_date else None,
                         "Time": row.get(col_time) if col_time else None,
@@ -1107,15 +1186,19 @@ if have_data:
                         "_debug_status": debug_status,
                     })
                     progress.progress((i + 1) / total_rows)
+
             status.text("Done ✅")
             final_df = pd.DataFrame(results)
+
             # Format dates & times
             if col_date:
                 final_df["Date"] = pd.to_datetime(final_df["Date"], errors="coerce").dt.strftime("%d/%m/%Y")
             if col_time:
                 final_df["Time"] = pd.to_datetime(final_df["Time"], errors="coerce").dt.strftime("%H:%M:%S")
+
             # Sort by Audio Call Duration descending (default for report)
             final_df.sort_values("Audio Call Duration", ascending=False, inplace=True)
+
             # Reorder columns for final display / export
             REORDERED_COLUMNS = [
                 "Audio Call Duration",
@@ -1132,23 +1215,26 @@ if have_data:
                 "Actual MP3",
             ]
             final_df = final_df[REORDERED_COLUMNS + ["_debug_status"]]
+
             # Generate Agent Analytics (with updated categories)
             agent_analytics_df = generate_agent_analytics(selected_df, '_duration_sec')
-
+            
             st.session_state["final_df"] = final_df
             st.session_state["agent_analytics_df"] = agent_analytics_df
+
             failed_count = (final_df["_debug_status"] != "OK").sum()
             if failed_count > 0:
                 st.error(f"⚠️ {failed_count} of {len(final_df)} call(s) failed to process — see warnings above for the reason.")
             else:
                 st.success("✅ All calls processed successfully.")
-            st.dataframe(final_df.drop(columns=["_debug_status"]), width='stretch', height=380)
 
+            st.dataframe(final_df.drop(columns=["_debug_status"]), use_container_width=True, height=380)
+            
             # Display Agent Analytics if available
             if agent_analytics_df is not None and len(agent_analytics_df) > 0:
                 st.markdown("### 📊 Agent-Wise Analytics")
                 st.info("Comprehensive breakdown of call performance by agent.")
-
+                
                 col1, col2 = st.columns(2)
                 with col1:
                     st.markdown("**🏆 Top Agents by Large Calls**")
@@ -1162,7 +1248,7 @@ if have_data:
                             </div>
                         </div>
                         """, unsafe_allow_html=True)
-
+                
                 with col2:
                     st.markdown("**📉 Agents with Most Short Calls**")
                     top_short = agent_analytics_df.nlargest(3, 'Short_Calls')[['Agent', 'Short_Calls', 'Short_%']]
@@ -1175,7 +1261,7 @@ if have_data:
                             </div>
                         </div>
                         """, unsafe_allow_html=True)
-
+                
                 # Show summary metrics
                 st.markdown("**📈 Performance Summary**")
                 m1, m2, m3, m4 = st.columns(4)
@@ -1190,7 +1276,7 @@ if have_data:
                 with m4:
                     best_large = agent_analytics_df.nlargest(1, 'Large_Calls')['Agent'].iloc[0] if len(agent_analytics_df) > 0 else "N/A"
                     st.metric("Most Large Calls", best_large)
-
+                
                 # Show detailed table
                 st.dataframe(
                     agent_analytics_df[[
@@ -1198,10 +1284,12 @@ if have_data:
                         'Medium_Calls', 'Medium_%', 'Large_Calls', 'Large_%',
                         'Avg_Duration_Formatted', 'Total_Duration_Formatted'
                     ]],
-                    width='stretch',
+                    use_container_width=True,
                     height=300
                 )
+
     st.markdown('</div>', unsafe_allow_html=True)
+
     # ============================================================
     # STEP 4 — DOWNLOAD FINAL REPORT
     # ============================================================
@@ -1223,9 +1311,10 @@ if have_data:
         st.markdown('<div class="step-card">', unsafe_allow_html=True)
         st.markdown('<div class="step-title"><span class="step-badge">4</span>Download Report</div>', unsafe_allow_html=True)
         st.markdown('<p class="step-subtitle">Excel file with two sheets: Detailed Call Report (now with Sentiment) and Agent-Wise Analytics (Short<2min, Medium 2-5min, Large>5min).</p>', unsafe_allow_html=True)
+
         export_df = st.session_state["final_df"][EXPORT_COLUMNS]
         agent_export_df = st.session_state.get("agent_analytics_df")
-
+        
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             export_df.to_excel(writer, index=False, sheet_name="Call Report")
