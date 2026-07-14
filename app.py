@@ -8,7 +8,7 @@ Flow:
   3. Fetch CDR report (auto-filtered by company_id)
   4. REMOVE VDCL AGENT CALLS (abandoned calls) - automatically filtered out
   5. Show ONE filtered data table with duration first, S.No, other columns
-  6. Pick call-type and count
+  6. Pick call-type and count with client-specific duration configs
   7. Choose sort order
   8. Run VAD (Silero) to get Talk Time / Silence / Dead Air / Longest Silence
   9. Transcribe each call with Groq Whisper → RoBERTa sentiment analysis → add Sentiment column
@@ -23,6 +23,7 @@ import time
 import shutil
 import subprocess
 import tempfile
+import json
 from datetime import date, timedelta
 from urllib.parse import urljoin
 
@@ -201,6 +202,14 @@ st.markdown("""
         color: #4F46E5;
         font-weight: 600;
     }
+    
+    .config-box {
+        background: #F8F7FF;
+        border: 2px solid #E4E1FF;
+        border-radius: 12px;
+        padding: 16px;
+        margin-top: 10px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -244,6 +253,42 @@ CLIENTS = {
     "Fortum Charge": "395",
     "Alphanso": "629",
 }
+
+# ============================================================
+# 🆕 CLIENT-SPECIFIC DURATION CONFIGURATIONS
+# ============================================================
+# Default configuration for all clients
+DEFAULT_DURATION_CONFIG = {
+    "short_max": 120,      # seconds (2 minutes)
+    "medium_min": 120,     # seconds (2 minutes)
+    "medium_max": 300,     # seconds (5 minutes)
+    "large_min": 300,      # seconds (5 minutes)
+}
+
+# Client-specific overrides
+CLIENT_DURATION_CONFIGS = {
+    "Weebo": {
+        "short_max": 90,      # 1.5 minutes
+        "medium_min": 90,
+        "medium_max": 240,    # 4 minutes
+        "large_min": 240,
+    },
+    "Hari Om Pvt Ltd": {
+        "short_max": 150,     # 2.5 minutes
+        "medium_min": 150,
+        "medium_max": 360,    # 6 minutes
+        "large_min": 360,
+    },
+    # Add more client-specific configs here
+    # "Client Name": {"short_max": 180, "medium_min": 180, "medium_max": 420, "large_min": 420},
+}
+
+def get_duration_config(client_name):
+    """Get duration configuration for a specific client"""
+    config = DEFAULT_DURATION_CONFIG.copy()
+    if client_name in CLIENT_DURATION_CONFIGS:
+        config.update(CLIENT_DURATION_CONFIGS[client_name])
+    return config
 
 # ============================================================
 # SESSION STATE DEFAULTS
@@ -815,6 +860,68 @@ if have_data:
     st.markdown('<div class="step-title"><span class="step-badge">2</span>Pick Call Type & Count</div>', unsafe_allow_html=True)
     st.markdown('<p class="step-subtitle">Choose which calls you want in the report.</p>', unsafe_allow_html=True)
 
+    # 🆕 Get client-specific duration configuration
+    duration_config = get_duration_config(client_name)
+    
+    # Show current config for the selected client
+    with st.expander(f"📊 Duration Configuration for {client_name}", expanded=False):
+        st.markdown(f"""
+        <div class="config-box">
+            <strong>Current Duration Settings:</strong><br>
+            • Short calls: &lt; {fmt_hms(duration_config['short_max'])} ({duration_config['short_max']} sec)<br>
+            • Medium calls: {fmt_hms(duration_config['medium_min'])} – {fmt_hms(duration_config['medium_max'])}<br>
+            • Large calls: &gt; {fmt_hms(duration_config['large_min'])} ({duration_config['large_min']} sec)<br>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Option to override configuration temporarily
+        st.caption("Override settings for this session (changes won't be saved permanently):")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            override_short = st.number_input(
+                "Short max (sec)", 
+                min_value=10, 
+                max_value=300, 
+                value=duration_config['short_max'],
+                step=10,
+                key="override_short"
+            )
+        with col2:
+            override_medium_min = st.number_input(
+                "Medium min (sec)", 
+                min_value=10, 
+                max_value=300, 
+                value=duration_config['medium_min'],
+                step=10,
+                key="override_medium_min"
+            )
+            override_medium_max = st.number_input(
+                "Medium max (sec)", 
+                min_value=override_medium_min, 
+                max_value=600, 
+                value=duration_config['medium_max'],
+                step=10,
+                key="override_medium_max"
+            )
+        with col3:
+            override_large = st.number_input(
+                "Large min (sec)", 
+                min_value=10, 
+                max_value=600, 
+                value=duration_config['large_min'],
+                step=10,
+                key="override_large"
+            )
+        
+        if st.button("Apply Overrides", key="apply_overrides"):
+            # Update config with overrides
+            duration_config['short_max'] = override_short
+            duration_config['medium_min'] = override_medium_min
+            duration_config['medium_max'] = override_medium_max
+            duration_config['large_min'] = override_large
+            st.success("✅ Configuration updated for this session!")
+            st.rerun()
+
     # Summary pills
     p1, p2, p3 = st.columns(3)
     with p1:
@@ -828,13 +935,18 @@ if have_data:
     # Filter controls - UPDATED with Custom Filter option
     bcol, ccol = st.columns([2, 1.2])
     with bcol:
+        # 🆕 Use client-specific duration config in bucket labels
+        short_label = f"Short (< {fmt_hms(duration_config['short_max'])})"
+        medium_label = f"Medium ({fmt_hms(duration_config['medium_min'])} – {fmt_hms(duration_config['medium_max'])})"
+        large_label = f"Large (> {fmt_hms(duration_config['large_min'])})"
+        
         bucket = st.radio(
             "Call type",
             [
                 "All calls",
-                "Short (< 2 min)",
-                "Medium (2 – 5 min)",
-                "Large (> 5 min)",
+                short_label,
+                medium_label,
+                large_label,
                 "Custom Filter",  # NEW option
             ],
             horizontal=True,
@@ -854,28 +966,26 @@ if have_data:
             """)
             custom_filter_expr = st.text_input(
                 "Filter expression",
-                value="duration < 120",
+                value=f"duration < {duration_config['short_max']}",
                 help="Use 'duration' as variable name. Example: duration < 120 (less than 2 min)",
                 key="custom_filter_input"
             )
-            # Show quick preset buttons
+            # Show quick preset buttons based on client config
             col_preset1, col_preset2, col_preset3, col_preset4 = st.columns(4)
             with col_preset1:
-                if st.button("⬇️ < 2 min", use_container_width=True):
-                    st.session_state.custom_filter_input = "duration < 120"
+                if st.button(f"⬇️ < {fmt_hms(duration_config['short_max'])}", use_container_width=True):
+                    st.session_state.custom_filter_input = f"duration < {duration_config['short_max']}"
                     st.rerun()
             with col_preset2:
-                if st.button("⬆️ > 8 min", use_container_width=True):
-                    st.session_state.custom_filter_input = "duration > 480"
+                if st.button(f"⬆️ > {fmt_hms(duration_config['large_min'])}", use_container_width=True):
+                    st.session_state.custom_filter_input = f"duration > {duration_config['large_min']}"
                     st.rerun()
             with col_preset3:
-                if st.button("📊 2-5 min", use_container_width=True):
-                    st.session_state.custom_filter_input = "duration >= 120 and duration <= 300"
+                if st.button(f"📊 {fmt_hms(duration_config['medium_min'])}-{fmt_hms(duration_config['medium_max'])}", use_container_width=True):
+                    st.session_state.custom_filter_input = f"duration >= {duration_config['medium_min']} and duration <= {duration_config['medium_max']}"
                     st.rerun()
             with col_preset4:
-                if st.button("📊 5-10 min", use_container_width=True):
-                    st.session_state.custom_filter_input = "duration >= 300 and duration <= 600"
-                    st.rerun()
+                st.button("📊 Custom Range", use_container_width=True, disabled=True)
     
     with ccol:
         count_mode = st.radio("How many calls?", ["All matching", "Manual number"], horizontal=True)
@@ -890,13 +1000,13 @@ if have_data:
     )
     ascending_sort = sort_order.startswith("Ascending")
 
-    # --- Determine selected data based on filters ---
-    if bucket == "Short (< 2 min)":
-        matched = cdr_df[cdr_df["_duration_sec"] < 120]
-    elif bucket == "Medium (2 – 5 min)":
-        matched = cdr_df[(cdr_df["_duration_sec"] >= 120) & (cdr_df["_duration_sec"] <= 300)]
-    elif bucket == "Large (> 5 min)":
-        matched = cdr_df[cdr_df["_duration_sec"] > 300]
+    # --- Determine selected data based on filters (using client-specific config) ---
+    if bucket == short_label:
+        matched = cdr_df[cdr_df["_duration_sec"] < duration_config['short_max']]
+    elif bucket == medium_label:
+        matched = cdr_df[(cdr_df["_duration_sec"] >= duration_config['medium_min']) & (cdr_df["_duration_sec"] <= duration_config['medium_max'])]
+    elif bucket == large_label:
+        matched = cdr_df[cdr_df["_duration_sec"] > duration_config['large_min']]
     elif bucket == "Custom Filter":
         matched = apply_custom_filter(cdr_df, custom_filter_expr)
         if len(matched) == 0:
