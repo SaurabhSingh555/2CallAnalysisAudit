@@ -23,7 +23,6 @@ import time
 import shutil
 import subprocess
 import tempfile
-import json
 from datetime import date, timedelta
 from urllib.parse import urljoin
 
@@ -241,6 +240,15 @@ try:
     GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 except:
     GROQ_API_KEY = ""
+
+# ============================================================
+# 🆕 HUGGING FACE TOKEN - load from secrets (optional but recommended)
+# ============================================================
+try:
+    HF_TOKEN = st.secrets["HF_TOKEN"]
+    os.environ["HF_TOKEN"] = HF_TOKEN
+except:
+    HF_TOKEN = None
 
 # ============================================================
 # ⚠️ CLIENTS - name -> company_id (edit this dict to add/remove clients)
@@ -646,10 +654,10 @@ def generate_agent_analytics(df, duration_col='_duration_sec'):
     return agent_stats
 
 # ============================================================
-# 🆕 GROQ WHISPER + SENTIMENT FUNCTIONS - FIXED (Lazy Loading)
+# 🆕 GROQ WHISPER + SENTIMENT FUNCTIONS - FIXED
 # ============================================================
 
-@st.cache_resource(show_spinner="Loading RoBERTa sentiment model (first run only)...")
+@st.cache_resource(show_spinner="🔄 Loading RoBERTa sentiment model (first run only)...")
 def load_sentiment_pipeline():
     """
     Load a RoBERTa-based sentiment analysis pipeline from Hugging Face.
@@ -658,12 +666,25 @@ def load_sentiment_pipeline():
     try:
         # Lazy import - only loads transformers when this function is called
         from transformers import pipeline
-        return pipeline(
-            "sentiment-analysis",
-            model="cardiffnlp/twitter-roberta-base-sentiment",
-            device=-1,  # CPU
-            top_k=None
-        )
+        
+        # Check if token is available
+        if HF_TOKEN:
+            # Authenticated request with token
+            return pipeline(
+                "sentiment-analysis",
+                model="cardiffnlp/twitter-roberta-base-sentiment",
+                device=-1,  # CPU
+                top_k=None,
+                token=HF_TOKEN  # Add token for authentication
+            )
+        else:
+            # Fallback to unauthenticated (with warning)
+            return pipeline(
+                "sentiment-analysis",
+                model="cardiffnlp/twitter-roberta-base-sentiment",
+                device=-1,  # CPU
+                top_k=None
+            )
     except Exception as e:
         st.warning(f"⚠️ Sentiment model not available: {e}")
         return None
@@ -947,7 +968,7 @@ if have_data:
                 short_label,
                 medium_label,
                 large_label,
-                "Custom Filter",  # NEW option
+                "Custom Filter",
             ],
             horizontal=True,
         )
@@ -1042,7 +1063,7 @@ if have_data:
     table_df = table_df[final_display_cols]
 
     st.markdown(f"### Filtered Data – Sorted by Duration ({'ascending' if ascending_sort else 'descending'})")
-    st.dataframe(table_df, use_container_width=True, height=350)
+    st.dataframe(table_df, width='stretch', height=350)
 
     st.markdown('</div>', unsafe_allow_html=True)  # end step-card
 
@@ -1080,8 +1101,14 @@ if have_data:
             # ---------- Load sentiment pipeline ----------
             sentiment_pipeline = load_sentiment_pipeline()
 
-            @st.cache_resource(show_spinner="Loading voice-detection model (first run only)...")
+            @st.cache_resource(show_spinner="🔄 Loading voice-detection model (first run only)...")
             def load_vad_model():
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                status_text.text("⏳ Setting up model directory...")
+                progress_bar.progress(20)
+                
                 hub_dir = os.path.expanduser("~/.cache/torch/hub")
                 try:
                     os.makedirs(hub_dir, exist_ok=True)
@@ -1090,6 +1117,10 @@ if have_data:
                     os.makedirs(hub_dir, exist_ok=True)
                 
                 torch.hub.set_dir(hub_dir)
+                
+                status_text.text("⏳ Downloading Silero VAD model...")
+                progress_bar.progress(50)
+                
                 try:
                     model, utils = torch.hub.load(
                         "snakers4/silero-vad", "silero_vad", force_reload=False, trust_repo=True
@@ -1098,6 +1129,15 @@ if have_data:
                     model, utils = torch.hub.load(
                         "snakers4/silero-vad", "silero_vad", force_reload=False
                     )
+                
+                progress_bar.progress(100)
+                status_text.text("✅ VAD model loaded successfully!")
+                
+                # Clear progress after 2 seconds
+                time.sleep(2)
+                progress_bar.empty()
+                status_text.empty()
+                
                 return model, utils
 
             model, utils = load_vad_model()
@@ -1338,7 +1378,7 @@ if have_data:
             else:
                 st.success("✅ All calls processed successfully.")
 
-            st.dataframe(final_df.drop(columns=["_debug_status"]), use_container_width=True, height=380)
+            st.dataframe(final_df.drop(columns=["_debug_status"]), width='stretch', height=380)
             
             # Display Agent Analytics if available
             if agent_analytics_df is not None and len(agent_analytics_df) > 0:
@@ -1394,7 +1434,7 @@ if have_data:
                         'Medium_Calls', 'Medium_%', 'Large_Calls', 'Large_%',
                         'Avg_Duration_Formatted', 'Total_Duration_Formatted'
                     ]],
-                    use_container_width=True,
+                    width='stretch',
                     height=300
                 )
 
