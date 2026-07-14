@@ -965,7 +965,8 @@ if have_data:
     table_df = table_df[final_display_cols]
 
     st.markdown(f"### Filtered Data – Sorted by Duration ({'ascending' if ascending_sort else 'descending'})")
-    st.dataframe(table_df, width='stretch', height=350)
+    # Fix: Use use_container_width=True instead of width='stretch'
+    st.dataframe(table_df, use_container_width=True, height=350)
 
     st.markdown('</div>', unsafe_allow_html=True)  # end step-card
 
@@ -1258,7 +1259,8 @@ if have_data:
             else:
                 st.success("✅ All calls processed successfully.")
 
-            st.dataframe(final_df.drop(columns=["_debug_status"]), width='stretch', height=380)
+            # Fix: Use use_container_width=True instead of width='stretch'
+            st.dataframe(final_df.drop(columns=["_debug_status"]), use_container_width=True, height=380)
             
             # Display Agent Analytics if available
             if agent_analytics_df is not None and len(agent_analytics_df) > 0:
@@ -1308,13 +1310,14 @@ if have_data:
                     st.metric("Most Large Calls", best_large)
                 
                 # Show detailed table
+                # Fix: Use use_container_width=True instead of width='stretch'
                 st.dataframe(
                     agent_analytics_df[[
                         'Rank', 'Agent', 'Total_Calls', 'Short_Calls', 'Short_%',
                         'Medium_Calls', 'Medium_%', 'Large_Calls', 'Large_%',
                         'Avg_Duration_Formatted', 'Total_Duration_Formatted'
                     ]],
-                    width='stretch',
+                    use_container_width=True,
                     height=300
                 )
 
